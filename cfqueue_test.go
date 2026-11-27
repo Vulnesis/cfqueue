@@ -5,20 +5,17 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
-
-	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/service/sqs"
-	"github.com/aws/aws-sdk-go-v2/service/sqs/types"
 )
 
 const qpath = "/client/v4/accounts/acct/queues/q1"
 
 // fakeQueues is an in-memory Cloudflare Queues REST API: push, pull (with
-// leases), ack. Leased messages are not returned again until acked or retried.
+// leases), ack. Leased messages are not returned again until acked.
 type fakeQueues struct {
 	mu       sync.Mutex
 	msgs     []map[string]any
@@ -27,12 +24,16 @@ type fakeQueues struct {
 	pulls    int
 	lastPull map[string]any
 	auth     string
+	ctype    string
+	method   string
 }
 
 func (f *fakeQueues) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.auth = r.Header.Get("Authorization")
+	f.ctype = r.Header.Get("Content-Type")
+	f.method = r.Method
 	var req map[string]any
 	_ = json.NewDecoder(r.Body).Decode(&req)
 	ok := func(result any) {
@@ -41,7 +42,7 @@ func (f *fakeQueues) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch r.URL.Path {
 	case qpath + "/messages":
 		f.n++
-		f.msgs = append(f.msgs, map[string]any{"id": "m" + string(rune('0'+f.n)), "body": req["body"], "attempts": 1.0, "ct": req["content_type"]})
+		f.msgs = append(f.msgs, map[string]any{"id": "m" + strconv.Itoa(f.n), "body": req["body"], "attempts": 1.0, "ct": req["content_type"]})
 		ok(nil)
 	case qpath + "/messages/pull":
 		f.pulls++
@@ -67,24 +68,25 @@ func (f *fakeQueues) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func setup(t *testing.T) (*fakeQueues, *Client, string) {
+// retry returns every leased message to the queue with one more attempt, as
+// Queues does when a lease's visibility timeout expires.
+func (f *fakeQueues) retry() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for id, m := range f.leased {
+		m["attempts"] = m["attempts"].(float64) + 1
+		f.msgs = append(f.msgs, m)
+		delete(f.leased, id)
+	}
+}
+
+func setup(t *testing.T) (*fakeQueues, *Client, *httptest.Server) {
 	f := &fakeQueues{leased: map[string]map[string]any{}}
 	srv := httptest.NewServer(f)
 	t.Cleanup(srv.Close)
-	c := New("tok")
+	c := New(srv.URL+qpath+"/", "tok")
 	c.PollInterval = 10 * time.Millisecond
-	// Route the real API prefix to the fake server.
-	c.HTTP = &http.Client{Transport: rewrite{srv.URL}}
-	return f, c, "https://api.cloudflare.com" + qpath
-}
-
-type rewrite struct{ base string }
-
-func (rw rewrite) RoundTrip(r *http.Request) (*http.Response, error) {
-	u := rw.base + r.URL.Path
-	r2, _ := http.NewRequestWithContext(r.Context(), r.Method, u, r.Body)
-	r2.Header = r.Header
-	return http.DefaultTransport.RoundTrip(r2)
+	return f, c, srv
 }
 
 func TestIsQueueURL(t *testing.T) {
@@ -102,53 +104,50 @@ func TestIsQueueURL(t *testing.T) {
 	}
 }
 
-func TestOpenPicksBackendByURL(t *testing.T) {
-	q, err := Open(aws.Config{Region: "ap-southeast-2"}, "https://sqs.ap-southeast-2.amazonaws.com/0614/x")
+func TestOpen(t *testing.T) {
+	const u = "https://api.cloudflare.com/client/v4/accounts/a/queues/q/"
+	t.Setenv("CF_QUEUES_API_TOKEN", "t")
+	if _, err := Open("https://sqs.ap-southeast-2.amazonaws.com/0614/x"); err == nil {
+		t.Fatal("want error for a non-Cloudflare URL")
+	}
+	c, err := Open(u)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := q.(*sqs.Client); !ok {
-		t.Fatalf("SQS URL gave %T", q)
+	if c.URL != strings.TrimSuffix(u, "/") || c.Token != "t" {
+		t.Fatalf("client %q %q", c.URL, c.Token)
 	}
 	t.Setenv("CF_QUEUES_API_TOKEN", "")
-	if _, err := Open(aws.Config{}, "https://api.cloudflare.com/client/v4/accounts/a/queues/q"); err == nil {
+	if _, err := Open(u); err == nil {
 		t.Fatal("want error without CF_QUEUES_API_TOKEN")
-	}
-	t.Setenv("CF_QUEUES_API_TOKEN", "t")
-	q, err = Open(aws.Config{}, "https://api.cloudflare.com/client/v4/accounts/a/queues/q")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, ok := q.(*Client); !ok {
-		t.Fatalf("Cloudflare URL gave %T", q)
 	}
 }
 
 func TestSendReceiveDeleteRoundTrip(t *testing.T) {
-	f, c, url := setup(t)
+	f, c, _ := setup(t)
 	ctx := context.Background()
 	body := `{"artifactUuid":"a1","orgId":"o1"}`
-	if _, err := c.SendMessage(ctx, &sqs.SendMessageInput{QueueUrl: aws.String(url), MessageBody: aws.String(body)}); err != nil {
+	if err := c.Send(ctx, body); err != nil {
 		t.Fatal(err)
 	}
-	if f.auth != "Bearer tok" || f.msgs[0]["ct"] != "text" {
-		t.Fatalf("auth %q content_type %v", f.auth, f.msgs[0]["ct"])
+	if f.auth != "Bearer tok" || f.ctype != "application/json" || f.method != http.MethodPost || f.msgs[0]["ct"] != "text" {
+		t.Fatalf("auth %q type %q method %s content_type %v", f.auth, f.ctype, f.method, f.msgs[0]["ct"])
 	}
-	out, err := c.ReceiveMessage(ctx, &sqs.ReceiveMessageInput{QueueUrl: aws.String(url), MaxNumberOfMessages: 10, VisibilityTimeout: 900})
+	msgs, err := c.Receive(ctx, ReceiveOptions{MaxMessages: 10, Visibility: 900 * time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(out.Messages) != 1 || aws.ToString(out.Messages[0].Body) != body {
-		t.Fatalf("got %+v", out.Messages)
+	if len(msgs) != 1 {
+		t.Fatalf("got %+v", msgs)
+	}
+	m := msgs[0]
+	if m.Body != body || m.ID != "m1" || m.ReceiptHandle != "lease-m1" || m.Attempts != 1 {
+		t.Fatalf("message %+v", m)
 	}
 	if f.lastPull["visibility_timeout_ms"].(float64) != 900000 || f.lastPull["batch_size"].(float64) != 10 {
 		t.Fatalf("pull %v", f.lastPull)
 	}
-	m := out.Messages[0]
-	if m.Attributes["ApproximateReceiveCount"] != "1" {
-		t.Fatalf("attributes %v", m.Attributes)
-	}
-	if _, err := c.DeleteMessage(ctx, &sqs.DeleteMessageInput{QueueUrl: aws.String(url), ReceiptHandle: m.ReceiptHandle}); err != nil {
+	if err := c.Delete(ctx, m.ReceiptHandle); err != nil {
 		t.Fatal(err)
 	}
 	if len(f.leased) != 0 {
@@ -156,47 +155,98 @@ func TestSendReceiveDeleteRoundTrip(t *testing.T) {
 	}
 }
 
+func TestReceiveDefaultsAndBatchClamp(t *testing.T) {
+	f, c, _ := setup(t)
+	ctx := context.Background()
+	if _, err := c.Receive(ctx, ReceiveOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if f.lastPull["batch_size"].(float64) != 1 || f.lastPull["visibility_timeout_ms"].(float64) != 30000 || f.pulls != 1 {
+		t.Fatalf("pull %v after %d pulls", f.lastPull, f.pulls)
+	}
+	if _, err := c.Receive(ctx, ReceiveOptions{MaxMessages: 500}); err != nil {
+		t.Fatal(err)
+	}
+	if f.lastPull["batch_size"].(float64) != 100 {
+		t.Fatalf("pull %v", f.lastPull)
+	}
+}
+
+func TestUndeletedMessageIsRedeliveredWithMoreAttempts(t *testing.T) {
+	f, c, _ := setup(t)
+	ctx := context.Background()
+	if err := c.Send(ctx, "x"); err != nil {
+		t.Fatal(err)
+	}
+	if msgs, err := c.Receive(ctx, ReceiveOptions{}); err != nil || len(msgs) != 1 {
+		t.Fatalf("%+v %v", msgs, err)
+	}
+	f.retry()
+	msgs, err := c.Receive(ctx, ReceiveOptions{})
+	if err != nil || len(msgs) != 1 || msgs[0].Attempts != 2 || msgs[0].Body != "x" {
+		t.Fatalf("%+v %v", msgs, err)
+	}
+}
+
 func TestReceiveLongPollsUntilWait(t *testing.T) {
-	f, c, url := setup(t)
+	f, c, _ := setup(t)
 	start := time.Now()
-	out, err := c.ReceiveMessage(context.Background(), &sqs.ReceiveMessageInput{QueueUrl: aws.String(url), WaitTimeSeconds: 1})
+	msgs, err := c.Receive(context.Background(), ReceiveOptions{Wait: time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(out.Messages) != 0 || time.Since(start) < 900*time.Millisecond || f.pulls < 3 {
-		t.Fatalf("messages %d after %v with %d pulls", len(out.Messages), time.Since(start), f.pulls)
+	if len(msgs) != 0 || time.Since(start) < 900*time.Millisecond || f.pulls < 3 {
+		t.Fatalf("messages %d after %v with %d pulls", len(msgs), time.Since(start), f.pulls)
 	}
 }
 
 func TestReceiveReturnsAsSoonAsAMessageArrives(t *testing.T) {
-	_, c, url := setup(t)
+	_, c, _ := setup(t)
 	go func() {
 		time.Sleep(50 * time.Millisecond)
-		_, _ = c.SendMessage(context.Background(), &sqs.SendMessageInput{QueueUrl: aws.String(url), MessageBody: aws.String("late")})
+		_ = c.Send(context.Background(), "late")
 	}()
-	out, err := c.ReceiveMessage(context.Background(), &sqs.ReceiveMessageInput{QueueUrl: aws.String(url), WaitTimeSeconds: 20})
-	if err != nil || len(out.Messages) != 1 || aws.ToString(out.Messages[0].Body) != "late" {
-		t.Fatalf("got %+v, %v", out, err)
+	msgs, err := c.Receive(context.Background(), ReceiveOptions{Wait: 20 * time.Second})
+	if err != nil || len(msgs) != 1 || msgs[0].Body != "late" {
+		t.Fatalf("got %+v, %v", msgs, err)
 	}
 }
 
-func TestUnsupportedAndErrors(t *testing.T) {
-	_, c, url := setup(t)
+func TestReceiveStopsOnContextCancel(t *testing.T) {
+	_, c, _ := setup(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, err := c.Receive(ctx, ReceiveOptions{Wait: 20 * time.Second}); err == nil {
+		t.Fatal("want context error")
+	}
+}
+
+func TestErrors(t *testing.T) {
+	_, c, srv := setup(t)
 	ctx := context.Background()
-	_, err := c.SendMessage(ctx, &sqs.SendMessageInput{QueueUrl: aws.String(url), MessageBody: aws.String("x"),
-		MessageAttributes: map[string]types.MessageAttributeValue{"k": {DataType: aws.String("String"), StringValue: aws.String("v")}}})
-	if err == nil {
-		t.Fatal("want error for message attributes")
-	}
-	if _, err := c.SendMessage(ctx, &sqs.SendMessageInput{QueueUrl: aws.String("https://sqs.x/q"), MessageBody: aws.String("x")}); err == nil {
-		t.Fatal("want error for an SQS URL")
-	}
-	bad := strings.Replace(url, "/q1", "/nope", 1)
-	if _, err := c.SendMessage(ctx, &sqs.SendMessageInput{QueueUrl: aws.String(bad), MessageBody: aws.String("x")}); err == nil || !strings.Contains(err.Error(), "10013") {
+	bad := New(srv.URL+"/client/v4/accounts/acct/queues/nope", "tok")
+	if err := bad.Send(ctx, "x"); err == nil || !strings.Contains(err.Error(), "10013") || !strings.Contains(err.Error(), "HTTP 404") {
 		t.Fatalf("want API error, got %v", err)
 	}
-	if _, err := c.DeleteMessage(ctx, &sqs.DeleteMessageInput{QueueUrl: aws.String(url)}); err == nil {
+	if err := c.Delete(ctx, ""); err == nil {
 		t.Fatal("want error for an empty receipt handle")
+	}
+	// success=false on HTTP 200 is still an error.
+	srv2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"success":false,"errors":[{"code":11000,"message":"queue paused"}]}`))
+	}))
+	defer srv2.Close()
+	if err := New(srv2.URL+qpath, "tok").Send(ctx, "x"); err == nil || !strings.Contains(err.Error(), "queue paused") {
+		t.Fatalf("want envelope error, got %v", err)
+	}
+	// A non-JSON response.
+	srv3 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte(`<html>bad gateway</html>`))
+	}))
+	defer srv3.Close()
+	if _, err := New(srv3.URL+qpath, "tok").Receive(ctx, ReceiveOptions{}); err == nil || !strings.Contains(err.Error(), "HTTP 502") {
+		t.Fatalf("want undecodable error, got %v", err)
 	}
 }
 
